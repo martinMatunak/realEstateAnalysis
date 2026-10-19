@@ -35,9 +35,11 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
            "Accept-Language": "sk-SK,sk;q=0.9"}
 FLAT_FIELDS = ["flat_id", "ids", "fp", "street", "layout", "area", "first_seen",
                "last_seen", "price_first", "price_last", "status", "initial",
-               "url", "title", "sig", "merges", "energy", "energy_amt", "parking"]
+               "url", "title", "sig", "merges", "energy", "energy_amt", "parking", "snap"]
 DAILY_FIELDS = ["date", "active", "new", "gone"]
 PRICE_FIELDS = ["date", "flat_id", "price"]
+EVENT_FIELDS = ["date", "type", "flat_id", "note"]
+MAX_CHECKS = 15          # najviac tolko starých inzerátov sa pri jednom behu ide overiť
 ID_RE = re.compile(r"/detail/([A-Za-z0-9]+)")
 LOC_RE = re.compile(r"Bratislava\s*-\s*Dev[ií]nska", re.I)   # adresa inzerátu musí byť v DNV
 SKIPPED = [0]                                                  # počet inzerátov z inej lokality
@@ -151,7 +153,7 @@ def parse_text(lid, text):
     en, ea = parse_energy(text)
     return {"id": lid, "price": price, "area": area, "layout": layout,
             "street": street, "status": status, "sig": make_sig(text),
-            "energy": en, "energy_amt": ea, "parking": parse_parking(text)}
+            "energy": en, "energy_amt": ea, "parking": parse_parking(text), "snap": text[:300]}
 
 
 def score(it):
@@ -300,6 +302,56 @@ def find_match(it, fp, flats, today, present, claimed):
     return best_f, best_s
 
 
+def check_listing(url):
+    """Pozrie starý inzerát a vráti krátky popis stavu."""
+    m = ID_RE.search(url or "")
+    if not m:
+        return "inzerát nemá odkaz"
+    fixture = os.environ.get("TRACKER_FIXTURE_DIR")
+    if fixture:
+        p = Path(fixture) / f"detail_{m.group(1)}.html"
+        if not p.exists():
+            return "stránka inzerátu už neexistuje (404)"
+        html = p.read_text(encoding="utf-8")
+    else:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            time.sleep(2)
+        except requests.RequestException:
+            return "nepodarilo sa overiť"
+        if r.status_code in (404, 410):
+            return "stránka inzerátu už neexistuje (404)"
+        if r.status_code != 200:
+            return f"nepodarilo sa overiť (HTTP {r.status_code})"
+        html = r.text
+    t = " ".join(BeautifulSoup(html, "html.parser").get_text(" ", strip=True).split()).lower()
+    if "už nie je aktuálny" in t or "uz nie je aktualny" in t:
+        return "inzerát je označený ako prenajatý" if "prenajat" in t[:1500] else "inzerát už nie je aktuálny"
+    return "inzerát je stále dostupný"
+
+
+def finish_events(flats, events, today):
+    """Overí zmiznuté inzeráty, uloží udalosti do data/events.csv a vráti všetky."""
+    t = today.isoformat()
+    by = {f["flat_id"]: f for f in flats}
+    n = 0
+    for e in events:
+        if e["type"] in ("gone", "rented") and n < MAX_CHECKS:
+            fl = by.get(e["flat_id"])
+            if fl and fl.get("url"):
+                n += 1
+                try:
+                    res = check_listing(fl["url"])
+                except Exception:
+                    res = "nepodarilo sa overiť"
+                e["note"] = "overenie: " + res
+                if res.endswith("stále dostupný"):
+                    e["note"] += " (pozor: možno ho výpis len vynechal)"
+    allv = [r for r in read_csv(DATA / "events.csv") if r["date"] != t] + events
+    write_csv(DATA / "events.csv", EVENT_FIELDS, allv)
+    return allv
+
+
 def update(items, today):
     t = today.isoformat()
     flats = read_csv(DATA / "listings.csv")
@@ -316,6 +368,10 @@ def update(items, today):
     prev = max((r["date"] for r in daily), default=None)
     present = {by_id[i["id"]]["flat_id"] for i in items if i["id"] in by_id}
     claimed = set()
+    events, merged_today = [], set()
+
+    def ev(typ, fl, note=""):
+        events.append({"date": t, "type": typ, "flat_id": fl["flat_id"], "note": note})
 
     today_flats = {}   # flat_id -> (flat row, cena, inzerát) s najnižšou cenou
     created = 0
@@ -330,6 +386,8 @@ def update(items, today):
                     claimed.add(fl["flat_id"])
                 fl["ids"] += "|" + it["id"]
                 fl["merges"] = (fl["merges"] + "|" if fl["merges"] else "") + f"{it['id']}:{sc}"
+                merged_today.add(fl["flat_id"])
+                ev("relist", fl, f"nový inzerát {it['id']}, zhoda {sc}")
                 by_id[it["id"]] = fl
         if fl is None:
             fl = {"flat_id": it["id"], "ids": it["id"], "fp": fp, "street": it["street"],
@@ -344,6 +402,8 @@ def update(items, today):
             flats.append(fl)
             by_id[it["id"]] = fl
             created += 1
+            if not first_run:
+                ev("new", fl)
             if it["price"]:
                 prices.append({"date": t, "flat_id": fl["flat_id"], "price": it["price"]})
         cur = today_flats.get(fl["flat_id"])
@@ -355,6 +415,10 @@ def update(items, today):
         if fl["last_seen"] != t or fl["first_seen"] != t:
             if price and str(price) != str(fl["price_last"]):
                 prices.append({"date": t, "flat_id": fl["flat_id"], "price": price})
+                if fl["price_last"]:
+                    ev("price", fl, f"{int(float(fl['price_last']))} → {price} €")
+        if prev and fl["last_seen"] < prev and fl["flat_id"] not in merged_today and fl["first_seen"] != t:
+            ev("back", fl, f"chýbal od {fl['last_seen']}")
         fl["last_seen"] = t
         if price:
             fl["price_last"] = price
@@ -367,33 +431,46 @@ def update(items, today):
             fl["sig"] = it["sig"]
         fl["energy"], fl["energy_amt"] = it.get("energy", ""), it.get("energy_amt") or ""
         fl["parking"] = it.get("parking", "")
+        fl["snap"] = it.get("snap", "")
         for k in ("street", "layout", "area"):
             if not fl[k] and it[k]:
                 fl[k] = it[k]
         if not fl["fp"]:
             fl["fp"] = fingerprint(it)
 
+    for f in flats:
+        if prev and f["last_seen"] == prev and f["last_seen"] != t:
+            ev("gone", f)
+    rented_done = {r["flat_id"] for r in read_csv(DATA / "events.csv") if r["type"] == "rented" and r["date"] != t}
+    for f in flats:
+        if (f["last_seen"] != t and f["flat_id"] not in rented_done and
+                (today - date.fromisoformat(f["last_seen"])).days >= GONE_AFTER_DAYS):
+            ev("rented", f)
     gone = sum(1 for f in flats if prev and f["last_seen"] == prev and f["last_seen"] != t)
     daily.append({"date": t, "active": len(today_flats), "new": 0 if first_run else created, "gone": gone})
     daily.sort(key=lambda r: r["date"])
     write_csv(DATA / "listings.csv", FLAT_FIELDS, flats)
     write_csv(DATA / "daily.csv", DAILY_FIELDS, daily)
     write_csv(DATA / "prices.csv", PRICE_FIELDS, prices)
-    return flats, daily
+    return flats, daily, events
 
 
 # ------------------------------------------------------------------- stránka
-def build_data(flats, daily, today):
+def build_data(flats, daily, today, events):
     scores = [int(m.split(":")[1]) for f in flats for m in f["merges"].split("|") if m]
+    pos = {f["flat_id"]: i for i, f in enumerate(flats)}
     return {
         "updated": today.isoformat(),
         "start": daily[0]["date"] if daily else today.isoformat(),
         "gone_after": GONE_AFTER_DAYS,
         "merges": {"n": len(scores), "weak": sum(1 for s in scores if s < MATCH_SURE)},
-        # [prvýkrát, naposledy, dispozícia, m², nájom, počiatočný(1/0), odkaz, ulica, energie, suma energií, parkovanie]
+        # [prvýkrát, naposledy, dispozícia, m², nájom, počiatočný(1/0), odkaz, ulica, energie, suma energií, parkovanie, text z posledného videnia]
         "flats": [[f["first_seen"], f["last_seen"], f["layout"], num(f["area"]), num(f["price_last"]),
-                   int(f["initial"] or 0), f["url"], f["street"], f["energy"], num(f["energy_amt"]) or 0, f["parking"]]
+                   int(f["initial"] or 0), f["url"], f["street"], f["energy"], num(f["energy_amt"]) or 0, f["parking"], f["snap"]]
                   for f in flats],
+        # [dátum, typ, index bytu, poznámka] od najnovších
+        "events": [[e["date"], e["type"], pos[e["flat_id"]], e["note"]]
+                   for e in sorted(events, key=lambda e: e["date"], reverse=True)[:400] if e["flat_id"] in pos],
     }
 
 
@@ -430,6 +507,9 @@ th:first-child,td:first-child,td.l,th.l{text-align:left}
 .s1{background:color-mix(in srgb,var(--s1) 22%,transparent)}.s2{background:color-mix(in srgb,var(--s1) 50%,transparent)}.s3{background:color-mix(in srgb,var(--s2) 55%,transparent)}
 .scale b{position:absolute;top:-4px;width:4px;height:18px;margin-left:-2px;border-radius:2px;background:var(--ink)}
 .scl{display:flex;font-size:12px;color:var(--ink2)}.scl span:nth-child(2){text-align:center}.scl span:nth-child(3){text-align:right}
+button.tile{font:inherit;color:inherit;background:none;text-align:left;cursor:pointer}
+button.tile:hover{border-color:var(--s1)}summary{cursor:pointer}details.card summary b{font-size:16px}
+#evt td:last-child{white-space:normal;min-width:220px}
 </style></head><body><main>
 <h1>Prenájmy bytov v Devínskej Novej Vsi</h1>
 <p class="sub" id="upd"></p>
@@ -450,10 +530,14 @@ th:first-child,td:first-child,td.l,th.l{text-align:left}
 <div class="card"><h2>Medián dní do obsadenia</h2><p>Podľa dispozície; len byty, ktoré sme videli pribudnúť aj zmiznúť</p><div class="box" id="b3"><canvas id="c3"></canvas></div></div>
 <div class="card"><h2>Medián nájmu za m²</h2><p>€/m² bytov, ktoré boli v ponuke v danom období (podľa zvolenej ceny hore)</p><div class="box" id="b4"><canvas id="c4"></canvas></div></div>
 </div>
-<div class="card" style="margin-top:16px"><h2>Inzeráty</h2><p>Klikni na dispozíciu alebo „otvoriť“, inzerát sa otvorí v novom okne.</p>
-<div class="bar"><label><input type="radio" name="w" value="act" checked> Aktívne teraz</label>
-<label><input type="radio" name="w" value="gone"> Zmizli v zvolenom období</label></div>
-<div class="scroll"><table id="lst"><thead><tr><th>Dispozícia</th><th class="l">Ulica</th><th>m²</th><th>Nájom</th><th>Energie</th><th>Spolu</th><th>Parkovanie</th><th id="dh">Od</th><th></th></tr></thead><tbody></tbody></table></div></div>
+<details class="card" id="listbox" style="margin-top:16px"><summary><b>Zoznam inzerátov</b> <span class="sub" style="display:inline;margin:0">(rozbal kliknutím, alebo klikni na číslo hore)</span></summary>
+<p class="sub" style="margin-top:8px">Klikni na dispozíciu alebo „otvoriť“, inzerát sa otvorí v novom okne. Keď podržíš myš nad dispozíciou, uvidíš text inzerátu z posledného videnia.</p>
+<div class="bar"><label><input type="radio" name="w" value="act" checked> Aktívne</label>
+<label><input type="radio" name="w" value="new"> Nové v období</label>
+<label><input type="radio" name="w" value="gone"> Zmizli (obsadené) v období</label></div>
+<div class="scroll"><table id="lst"><thead><tr><th>Dispozícia</th><th class="l">Ulica</th><th>m²</th><th>Nájom</th><th>Energie</th><th>Spolu</th><th>Parkovanie</th><th id="dh">Od</th><th></th></tr></thead><tbody></tbody></table></div></details>
+<details class="card" id="evbox" style="margin-top:16px"><summary><b>Udalosti</b> (<span id="evn">0</span>) <span class="sub" style="display:inline;margin:0">nové, zmiznuté, obsadené a zmeny cien, aby si vedela skontrolovať, ktorý byt to bol</span></summary>
+<div class="scroll"><table id="evt"><thead><tr><th>Dátum</th><th class="l">Udalosť</th><th class="l">Byt</th><th class="l">Overenie / poznámka</th></tr></thead><tbody></tbody></table></div></details>
 <details><summary>Tabuľka po dňoch</summary><div class="scroll">
 <table id="tbl"><thead><tr><th>Dátum</th><th>Aktívne</th><th>Nové</th><th>Zmizli</th></tr></thead><tbody></tbody></table></div></details>
 <p class="note" id="note"></p>
@@ -473,7 +557,7 @@ const fmt = n => n == null ? '–' : String(Math.round(n * 10) / 10).replace('.'
 const store = {get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
                set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }};
 const T = D.updated, CUT = addD(T, -D.gone_after);
-const F = D.flats.map(r => ({first: r[0], last: r[1], lay: lab(r[2]), area: r[3], p: r[4], init: r[5], url: r[6], street: r[7], en: r[8], ea: r[9], pk: r[10]}));
+const F = D.flats.map(r => ({first: r[0], last: r[1], lay: lab(r[2]), area: r[3], p: r[4], init: r[5], url: r[6], street: r[7], en: r[8], ea: r[9], pk: r[10], snap: r[11]}));
 const total = f => !f.p ? null : (f.en === 'incl' ? f.p : (f.en === 'sep' && f.ea ? f.p + f.ea : null));
 const rentOnly = f => (f.p && (f.en === 'sep' || f.en === 'sep?')) ? f.p : null;
 const pr = f => $('pm').value === 'rent' ? rentOnly(f) : total(f);
@@ -553,13 +637,14 @@ function refresh() {
   $('pkcmp').textContent = 'Medián ceny za byt ' + pmTxt + ': s parkovaním ' + cmp(base.filter(f => hasP(f) && inWin(f)).map(pr)) +
     ', bez parkovania / neuvedené ' + cmp(base.filter(f => !hasP(f) && inWin(f)).map(pr)) + '.';
   $('tiles').innerHTML = [
-    [act, to === T ? 'aktívnych inzerátov teraz' : 'aktívnych inzerátov k ' + to],
-    [sum('nw'), 'nových v období'],
-    [sum('gone'), 'zmizlo (obsadených) v období'],
+    [act, to === T ? 'aktívnych inzerátov teraz' : 'aktívnych inzerátov k ' + to, 'act'],
+    [sum('nw'), 'nových v období', 'new'],
+    [sum('gone'), 'zmizlo (obsadených) v období', 'gone'],
     [durs.length ? fmt(med(durs)) + ' dní' : '–', 'medián obsadenia (n=' + durs.length + ')'],
     [prNow.length ? fmt(med(prNow)) + ' €' : '–', 'medián ceny za byt mesačne, ' + pmTxt + ' (n=' + prNow.length + ')'],
     [eurNow.length ? fmt(med(eurNow)) + ' €/m²' : '–', 'medián za m², ' + pmTxt + ' (n=' + eurNow.length + ')']
-  ].map(x => '<div class="tile"><b>' + x[0] + '</b><span>' + x[1] + '</span></div>').join('');
+  ].map(x => x[2] ? '<button class="tile" data-w="' + x[2] + '"><b>' + x[0] + '</b><span>' + x[1] + ' ▾</span></button>'
+                  : '<div class="tile"><b>' + x[0] + '</b><span>' + x[1] + '</span></div>').join('');
 
   // ponuka vs. dopyt: zásoba v mesiacoch = aktívne byty / tempo obsadzovania za mesiac
   const LIM = {tight: 0.75, loose: 2};   // orientačné hranice (mesiace zásoby)
@@ -615,18 +700,36 @@ function refresh() {
   document.querySelector('#tbl tbody').innerHTML = days.slice().reverse().slice(0, 90).map(x =>
     '<tr><td>' + x.d + '</td><td>' + x.active + '</td><td>' + x.nw + '</td><td>' + x.gone + '</td></tr>').join('');
 
-  const gone = document.querySelector('input[name=w]:checked').value === 'gone';
-  const rows = gone ? goneAll.slice().sort((a, b) => b.last.localeCompare(a.last))
-                    : sel.filter(f => f.last === T).sort((a, b) => b.first.localeCompare(a.first));
+  const view = document.querySelector('input[name=w]:checked').value, gone = view === 'gone';
+  let rows;
+  if (gone) rows = goneAll.slice().sort((a, b) => b.last.localeCompare(a.last));
+  else {
+    rows = view === 'new' ? sel.filter(f => !f.init && f.first >= from && f.first <= to)
+                          : sel.filter(f => f.first <= to && f.last >= to);
+    rows = rows.sort((a, b) => b.first.localeCompare(a.first));
+  }
   $('dh').textContent = gone ? 'Naposledy videný' : 'Od';
   $('lst').querySelector('tbody').innerHTML = rows.length ? rows.map(r => {
     const ok = /^https:\/\//.test(r.url);
-    const link = ok ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener">' : '';
+    const link = ok ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" title="' + esc(r.snap) + '">' : '';
     return '<tr><td>' + (ok ? link + esc(r.lay) + '</a>' : esc(r.lay)) + '</td><td class="l">' + esc(r.street) + '</td><td>' +
       esc(r.area == null ? '' : r.area) + '</td><td>' + (r.p ? esc(r.p) + ' €' : '') + '</td><td>' + esc(enTxt(r)) + '</td><td>' +
       (total(r) ? esc(total(r)) + ' €' : '–') + '</td><td>' + esc(pkTxt(r)) + '</td><td>' +
       (gone ? r.last : r.first) + '</td><td>' + (ok ? link + 'otvoriť</a>' : '') + '</td></tr>';
   }).join('') : '<tr><td colspan="9">Žiadne inzeráty.</td></tr>';
+
+  const EVT = {new: 'Nový inzerát', gone: 'Zmizol z ponuky', rented: 'Potvrdený ako obsadený', price: 'Zmena ceny',
+               relist: 'Obnovený inzerát (nové ID)', back: 'Znovu v ponuke'};
+  const selSet = new Set(sel);
+  const evs = D.events.filter(e => e[0] >= from && e[0] <= to && selSet.has(F[e[2]]));
+  $('evn').textContent = evs.length;
+  $('evt').querySelector('tbody').innerHTML = evs.length ? evs.map(e => {
+    const f = F[e[2]], ok = /^https:\/\//.test(f.url);
+    const name = esc(f.lay) + ' · ' + esc(f.street || '—') + ' · ' + (f.area == null ? '?' : esc(f.area)) + ' m² · ' + (f.p ? esc(f.p) + ' €' : '?');
+    return '<tr><td>' + e[0] + '</td><td class="l">' + esc(EVT[e[1]] || e[1]) + '</td><td class="l">' +
+      (ok ? '<a href="' + esc(f.url) + '" target="_blank" rel="noopener" title="' + esc(f.snap) + '">' + name + '</a>' : name) +
+      '</td><td class="l">' + esc(e[3]) + '</td></tr>';
+  }).join('') : '<tr><td colspan="4">Žiadne udalosti v tomto období.</td></tr>';
 
   const now = sel.filter(f => f.last === T), unk = now.filter(f => !pr(f)).length;
   const m = D.merges;
@@ -640,6 +743,12 @@ function refresh() {
 $('per').addEventListener('change', () => { $('cust').hidden = $('per').value !== 'custom'; store.set('per', $('per').value); refresh(); });
 $('lay').addEventListener('change', () => { store.set('lay', $('lay').value); refresh(); });
 $('pkf').addEventListener('change', refresh);
+$('tiles').addEventListener('click', e => {
+  const b = e.target.closest('[data-w]'); if (!b) return;
+  document.querySelector('input[name=w][value=' + b.dataset.w + ']').checked = true;
+  $('listbox').open = true; refresh();
+  $('listbox').scrollIntoView({behavior: 'smooth', block: 'start'});
+});
 $('pm').addEventListener('change', () => { store.set('pm', $('pm').value); refresh(); });
 [$('d1'), $('d2')].forEach(i => i.addEventListener('change', refresh));
 document.querySelectorAll('input[name=w]').forEach(i => i.addEventListener('change', refresh));
@@ -668,8 +777,9 @@ def main():
     prev_active = int(prev_daily[-1]["active"]) if prev_daily and prev_daily[-1]["date"] != today.isoformat() else 0
     if prev_active and len(items) < 0.5 * prev_active:
         sys.exit(f"CHYBA: našlo sa len {len(items)} inzerátov oproti {prev_active} včera. Dáta som nezmenil.")
-    flats, daily = update(items, today)
-    build_site(build_data(flats, daily, today))
+    flats, daily, events = update(items, today)
+    all_events = finish_events(flats, events, today)
+    build_site(build_data(flats, daily, today, all_events))
     print(f"OK {today}: {len(items)} inzerátov, {daily[-1]['active']} aktívnych bytov, "
           f"preskočených (iná lokalita): {SKIPPED[0]}")
 
