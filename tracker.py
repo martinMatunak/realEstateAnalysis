@@ -32,7 +32,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                          "(KHTML, like Gecko) Chrome/124 Safari/537.36",
            "Accept-Language": "sk-SK,sk;q=0.9"}
 FLAT_FIELDS = ["flat_id", "ids", "fp", "street", "layout", "area", "first_seen",
-               "last_seen", "price_first", "price_last", "status", "initial"]
+               "last_seen", "price_first", "price_last", "status", "initial", "url", "title"]
 DAILY_FIELDS = ["date", "active", "new", "gone"]
 PRICE_FIELDS = ["date", "flat_id", "price"]
 ID_RE = re.compile(r"/detail/([A-Za-z0-9]+)")
@@ -94,9 +94,14 @@ def score(it):
 
 def parse(html):
     soup = BeautifulSoup(html, "html.parser")
-    found = {}
+    found, urls, titles = {}, {}, {}
     for a in soup.find_all("a", href=ID_RE):
         lid = ID_RE.search(a["href"]).group(1)
+        href = a["href"].split("?")[0].split("#")[0]
+        urls.setdefault(lid, BASE + href if href.startswith("/") else href)
+        label = " ".join(a.get_text(" ", strip=True).split())
+        if len(label) > len(titles.get(lid, "")):
+            titles[lid] = label[:100]
         node = a
         # kartu = najväčší predok, ktorý obsahuje odkazy len na jeden inzerát
         while node.parent is not None and node.parent.name not in ("body", "html", "[document]"):
@@ -109,6 +114,8 @@ def parse(html):
         item = parse_text(lid, text)
         if lid not in found or score(item) > score(found[lid]):
             found[lid] = item
+    for lid, it in found.items():
+        it["url"], it["title"] = urls.get(lid, ""), titles.get(lid, "")
     return list(found.values())
 
 
@@ -190,7 +197,8 @@ def update(items, today):
                   "layout": it["layout"] or "", "area": it["area"] or "",
                   "first_seen": t, "last_seen": t,
                   "price_first": it["price"] or "", "price_last": it["price"] or "",
-                  "status": it["status"], "initial": "1" if first_run else "0"}
+                  "status": it["status"], "initial": "1" if first_run else "0",
+                  "url": it.get("url", ""), "title": it.get("title", "")}
             flats.append(fl)
             by_id[it["id"]] = fl
             created += 1
@@ -213,6 +221,8 @@ def update(items, today):
             if not fl["price_first"]:
                 fl["price_first"] = price
         fl["status"] = it["status"]
+        if it.get("url"):
+            fl["url"], fl["title"] = it["url"], it.get("title", "")
         for k in ("street", "layout", "area"):
             if not fl[k] and it[k]:
                 fl[k] = it[k]
@@ -275,7 +285,16 @@ def analyse(flats, daily, today):
         if p and a and a >= 15:
             eur.setdefault(week_start(f["first_seen"]), []).append(p / a)
 
+    def row(f):
+        return {"url": f.get("url", ""), "layout": layout_label(f["layout"]) if f["layout"] else "?",
+                "street": f["street"], "area": num(f["area"]), "price": num(f["price_last"]),
+                "first": f["first_seen"], "last": f["last_seen"], "title": f.get("title", "")}
+    listing = sorted((row(f) for f in flats if f["last_seen"] == t), key=lambda r: r["first"], reverse=True)
+    gone_list = sorted((row(f) for f in flats if d30 <= f["last_seen"] <= cutoff),
+                       key=lambda r: r["last"], reverse=True)
+
     return {
+        "list": listing, "gone": gone_list,
         "updated": t,
         "tiles": {"active": active, "new7": new7, "rented30": rented30,
                   "median_days": median_days, "n_durations": len(all_d)},
@@ -311,6 +330,9 @@ details{margin-top:20px}summary{cursor:pointer;color:var(--ink2)}
 table{border-collapse:collapse;width:100%;font-size:14px;margin-top:8px}
 td,th{border-bottom:1px solid var(--line);padding:4px 8px;text-align:right}th:first-child,td:first-child{text-align:left}
 .note{color:var(--ink2);font-size:13px;margin-top:18px}
+.bar{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:8px;font-size:14px}
+select{font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:4px 8px}
+a{color:var(--s1)}.scroll{overflow-x:auto}
 </style></head><body><main>
 <h1>Prenájmy bytov v Devínskej Novej Vsi</h1>
 <p class="sub" id="upd"></p>
@@ -321,6 +343,11 @@ td,th{border-bottom:1px solid var(--line);padding:4px 8px;text-align:right}th:fi
 <div class="card"><h2>Medián dní do obsadenia</h2><p>Podľa dispozície; len byty, ktoré sme videli pribudnúť aj zmiznúť</p><div class="box" id="b3"><canvas id="c3"></canvas></div></div>
 <div class="card"><h2>Medián nájmu za m²</h2><p>€/m² pri prvom zverejnení, po týždňoch</p><div class="box" id="b4"><canvas id="c4"></canvas></div></div>
 </div>
+<div class="card" style="margin-top:16px"><h2>Inzeráty</h2><p>Klikni na dispozíciu alebo „otvoriť“, inzerát sa otvorí v novom okne.</p>
+<div class="bar"><select id="fl" aria-label="Dispozícia"></select>
+<label><input type="radio" name="w" value="act" checked> Aktívne</label>
+<label><input type="radio" name="w" value="gone"> Zmizli za 30 dní</label></div>
+<div class="scroll"><table id="lst"><thead><tr><th>Dispozícia</th><th>Ulica</th><th>m²</th><th>Nájom</th><th id="dh">Od</th><th></th></tr></thead><tbody></tbody></table></div></div>
 <details><summary>Tabuľka posledných dní</summary>
 <table id="tbl"><thead><tr><th>Dátum</th><th>Aktívne</th><th>Nové</th><th>Zmizli</th></tr></thead><tbody></tbody></table></details>
 <p class="note">Za „obsadený“ sa berie byt, ktorého inzerát zmizol aspoň 7 dní. Byty videné hneď pri prvom behu sa do doby obsadenia nerátajú (nevieme, odkedy visia). Cena je nájom z inzerátu, energie bývajú zvlášť alebo v cene podľa inzerátu. Čísla budú spoľahlivé po niekoľkých týždňoch až mesiacoch zberu.</p>
@@ -364,6 +391,25 @@ function render() {
   make('c3', 'b3', 'bar', D.duration.labels, [{c: '--s1', o: {label: 'Medián dní', data: D.duration.values}}], 1, false);
   make('c4', 'b4', 'line', D.eur.labels, [{c: '--s1', o: {label: '€/m²', data: D.eur.values}}], 2, false);
 }
+const esc = x => String(x == null ? '' : x).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+const fl = document.getElementById('fl');
+const kinds = [...new Set(D.list.concat(D.gone).map(r => r.layout))].sort();
+fl.innerHTML = '<option value="">Všetky dispozície</option>' + kinds.map(k => '<option>' + esc(k) + '</option>').join('');
+function lst() {
+  const gone = document.querySelector('input[name=w]:checked').value === 'gone';
+  const f = fl.value, rows = (gone ? D.gone : D.list).filter(r => !f || r.layout === f);
+  document.getElementById('dh').textContent = gone ? 'Naposledy videný' : 'Od';
+  document.querySelector('#lst tbody').innerHTML = rows.length ? rows.map(r => {
+    const ok = /^https:\/\//.test(r.url);
+    const a = ok ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener">' + esc(r.layout) + '</a>' : esc(r.layout);
+    return '<tr><td>' + a + '</td><td>' + esc(r.street) + '</td><td>' + esc(r.area) + '</td><td>' +
+      (r.price ? esc(r.price) + ' €' : '') + '</td><td>' + (gone ? r.last : r.first) + '</td><td>' +
+      (ok ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener">otvoriť</a>' : '') + '</td></tr>';
+  }).join('') : '<tr><td colspan="6">Žiadne inzeráty.</td></tr>';
+}
+fl.addEventListener('change', lst);
+document.querySelectorAll('input[name=w]').forEach(i => i.addEventListener('change', lst));
+lst();
 render();
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { render(); });
 </script></body></html>
