@@ -25,7 +25,7 @@ MAX_PAGES = 5
 GONE_AFTER_DAYS = 7      # inzerát zmizol aspoň tak dlho = byt považujeme za obsadený
 REMATCH_DAYS = 14        # nový inzerát môže byť obnovením bytu, ktorý zmizol najviac pred toľkými dňami
 MATCH_VANISHED = 6       # minimálne skóre zhody s bytom, ktorého inzerát zmizol
-MATCH_LIVE = 9           # minimálne skóre zhody s bytom, ktorý je v ponuke aj dnes (duplicitný inzerát)
+MATCH_LIVE = 13          # byt, ktorý je v ponuke aj dnes: spojí sa len pri zhode čísla domu (inak ide o iný byt)
 MATCH_SURE = 8           # od tohto skóre je spojenie "isté"
 DATA = Path("data")
 SITE = Path("docs")
@@ -35,7 +35,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
            "Accept-Language": "sk-SK,sk;q=0.9"}
 FLAT_FIELDS = ["flat_id", "ids", "fp", "street", "layout", "area", "first_seen",
                "last_seen", "price_first", "price_last", "status", "initial",
-               "url", "title", "sig", "merges", "energy", "energy_amt", "parking", "snap"]
+               "url", "title", "sig", "merges", "energy", "energy_amt", "parking", "snap", "alts", "cond"]
 DAILY_FIELDS = ["date", "active", "new", "gone"]
 PRICE_FIELDS = ["date", "flat_id", "price"]
 EVENT_FIELDS = ["date", "type", "flat_id", "note"]
@@ -122,6 +122,23 @@ def parse_parking(text):
     return "yes" if ded else "street"
 
 
+def parse_condition(text):
+    """Stav bytu: new = novostavba, full = kompletná rekonštrukcia, partial = čiastočná,
+    reko = rekonštrukcia (rozsah neuvedený), orig = pôvodný stav, '' = neuvedené."""
+    t = text.lower()
+    if re.search(r"čiastočn\w*\s+(?:zrekonštr|rekonštr)", t):
+        return "partial"
+    if re.search(r"(?:kompletn|úpln|celkov|totáln)\w*\s+(?:zrekonštr|rekonštr)", t):
+        return "full"
+    if "novostavb" in t:
+        return "new"
+    if re.search(r"rekonštruk|zrekonštruovan", t):
+        return "reko"
+    if re.search(r"pôvodn\w*\s+stav|v\s+pôvodnom", t):
+        return "orig"
+    return ""
+
+
 def parse_text(lid, text):
     price = None
     m = re.search(r"(\d{1,3}(?:[\s ]\d{3})+|\d{2,5})\s*€\s*/\s*mes", text)
@@ -153,7 +170,8 @@ def parse_text(lid, text):
     en, ea = parse_energy(text)
     return {"id": lid, "price": price, "area": area, "layout": layout,
             "street": street, "status": status, "sig": make_sig(text),
-            "energy": en, "energy_amt": ea, "parking": parse_parking(text), "snap": text[:300]}
+            "energy": en, "energy_amt": ea, "parking": parse_parking(text), "snap": text[:300],
+            "cond": parse_condition(text)}
 
 
 def score(it):
@@ -352,12 +370,53 @@ def finish_events(flats, events, today):
     return allv
 
 
+def load_no_merge():
+    """ID inzerátov z data/no_merge.txt sa nikdy nespoja s iným bytom (jedno ID na riadok)."""
+    p = DATA / "no_merge.txt"
+    if not p.exists():
+        return set()
+    out = set()
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.split("#")[0].strip()
+        if line:
+            out.add(line)
+    return out
+
+
+def split_merged(flats, nm):
+    """Rozdelí späť inzeráty, ktoré používateľ označil ako samostatný byt."""
+    for f in list(flats):
+        ids = f["ids"].split("|")
+        if not any(i in nm for i in ids[1:]):
+            continue
+        alts = json.loads(f.get("alts") or "[]")
+        keep = [ids[0]]
+        for i in ids[1:]:
+            if i not in nm:
+                keep.append(i)
+                continue
+            a = next((x for x in alts if x["id"] == i), {})
+            new = dict(f)
+            new.update({"flat_id": i, "ids": i, "fp": "", "merges": "", "alts": "",
+                        "url": a.get("url") or f["url"],
+                        "price_last": a.get("price") or f["price_last"],
+                        "price_first": a.get("price") or f["price_first"],
+                        "area": a.get("area") or f["area"],
+                        "first_seen": a.get("date") or f["first_seen"]})
+            flats.append(new)
+        f["ids"] = "|".join(keep)
+        f["merges"] = "|".join(m for m in f["merges"].split("|") if m and m.split(":")[0] not in nm)
+        f["alts"] = json.dumps([x for x in alts if x["id"] not in nm], ensure_ascii=False) if alts else ""
+
+
 def update(items, today):
     t = today.isoformat()
     flats = read_csv(DATA / "listings.csv")
     for f in flats:
         for k in FLAT_FIELDS:
             f.setdefault(k, "")
+    nm = load_no_merge()
+    split_merged(flats, nm)
     daily = [r for r in read_csv(DATA / "daily.csv") if r["date"] != t]
     prices = [r for r in read_csv(DATA / "prices.csv") if r["date"] != t]
     first_run = not flats
@@ -378,7 +437,7 @@ def update(items, today):
     for it in items:
         fl = by_id.get(it["id"])
         fp = fingerprint(it)
-        if fl is None:
+        if fl is None and it["id"] not in nm:
             cand, sc = find_match(it, fp, flats, today, present, claimed)
             if cand is not None:
                 fl = cand
@@ -386,6 +445,10 @@ def update(items, today):
                     claimed.add(fl["flat_id"])
                 fl["ids"] += "|" + it["id"]
                 fl["merges"] = (fl["merges"] + "|" if fl["merges"] else "") + f"{it['id']}:{sc}"
+                alts = json.loads(fl["alts"] or "[]")
+                alts.append({"id": it["id"], "sc": sc, "url": it.get("url", ""), "price": it["price"] or "",
+                             "area": it["area"] or "", "date": t, "snap": it.get("snap", "")[:160]})
+                fl["alts"] = json.dumps(alts, ensure_ascii=False)
                 merged_today.add(fl["flat_id"])
                 ev("relist", fl, f"nový inzerát {it['id']}, zhoda {sc}")
                 by_id[it["id"]] = fl
@@ -396,7 +459,7 @@ def update(items, today):
                   "price_first": it["price"] or "", "price_last": it["price"] or "",
                   "status": it["status"], "initial": "1" if first_run else "0",
                   "url": it.get("url", ""), "title": it.get("title", ""),
-                  "sig": it.get("sig", ""), "merges": "",
+                  "sig": it.get("sig", ""), "merges": "", "alts": "", "cond": it.get("cond", ""),
                   "energy": it.get("energy", ""), "energy_amt": it.get("energy_amt") or "",
                   "parking": it.get("parking", "")}
             flats.append(fl)
@@ -432,6 +495,8 @@ def update(items, today):
         fl["energy"], fl["energy_amt"] = it.get("energy", ""), it.get("energy_amt") or ""
         fl["parking"] = it.get("parking", "")
         fl["snap"] = it.get("snap", "")
+        if it.get("cond"):
+            fl["cond"] = it["cond"]
         for k in ("street", "layout", "area"):
             if not fl[k] and it[k]:
                 fl[k] = it[k]
@@ -464,11 +529,12 @@ def build_data(flats, daily, today, events):
         "start": daily[0]["date"] if daily else today.isoformat(),
         "gone_after": GONE_AFTER_DAYS,
         "merges": {"n": len(scores), "weak": sum(1 for s in scores if s < MATCH_SURE)},
-        # [prvýkrát, naposledy, dispozícia, m², nájom, počiatočný(1/0), odkaz, ulica, energie, suma energií, parkovanie, text z posledného videnia]
+        # [prvýkrát, naposledy, dispozícia, m², nájom, počiatočný(1/0), odkaz, ulica, energie, suma energií, parkovanie, text z posledného videnia, stav]
         "flats": [[f["first_seen"], f["last_seen"], f["layout"], num(f["area"]), num(f["price_last"]),
-                   int(f["initial"] or 0), f["url"], f["street"], f["energy"], num(f["energy_amt"]) or 0, f["parking"], f["snap"]]
+                   int(f["initial"] or 0), f["url"], f["street"], f["energy"], num(f["energy_amt"]) or 0, f["parking"], f["snap"], f.get("cond", "")]
                   for f in flats],
         # [dátum, typ, index bytu, poznámka] od najnovších
+        "merged": [[pos[f["flat_id"]], json.loads(f["alts"])] for f in flats if f["alts"]],
         "events": [[e["date"], e["type"], pos[e["flat_id"]], e["note"]]
                    for e in sorted(events, key=lambda e: e["date"], reverse=True)[:400] if e["flat_id"] in pos],
     }
@@ -519,6 +585,7 @@ button.tile:hover{border-color:var(--s1)}summary{cursor:pointer}details.card sum
 <label>Dispozícia <select id="lay"></select></label>
 <label>Cena <select id="pm"><option value="total">celkom s energiami</option><option value="rent">len nájom bez energií</option></select></label>
 <label>Parkovanie <select id="pkf"><option value="">všetky</option><option value="yes">áno (v cene)</option><option value="extra">za príplatok</option><option value="no">bez / neuvedené</option></select></label>
+<label>Stav <select id="cdf"><option value="">všetky</option><option value="new">novostavba</option><option value="full">kompletná rekonštrukcia</option><option value="partial">čiastočná rekonštrukcia</option><option value="reko">po rekonštrukcii (rozsah neuvedený)</option><option value="orig">pôvodný stav</option><option value="none">neuvedený</option></select></label>
 </div>
 <p class="sub" id="cap"></p>
 <p class="sub" id="pkcmp"></p>
@@ -535,9 +602,12 @@ button.tile:hover{border-color:var(--s1)}summary{cursor:pointer}details.card sum
 <div class="bar"><label><input type="radio" name="w" value="act" checked> Aktívne</label>
 <label><input type="radio" name="w" value="new"> Nové v období</label>
 <label><input type="radio" name="w" value="gone"> Zmizli (obsadené) v období</label></div>
-<div class="scroll"><table id="lst"><thead><tr><th>Dispozícia</th><th class="l">Ulica</th><th>m²</th><th>Nájom</th><th>Energie</th><th>Spolu</th><th>Parkovanie</th><th id="dh">Od</th><th></th></tr></thead><tbody></tbody></table></div></details>
+<div class="scroll"><table id="lst"><thead><tr><th>Dispozícia</th><th class="l">Ulica</th><th>m²</th><th>Nájom</th><th>Energie</th><th>Spolu</th><th>Parkovanie</th><th>Stav</th><th id="dh">Od</th><th></th></tr></thead><tbody></tbody></table></div></details>
 <details class="card" id="evbox" style="margin-top:16px"><summary><b>Udalosti</b> (<span id="evn">0</span>) <span class="sub" style="display:inline;margin:0">nové, zmiznuté, obsadené a zmeny cien, aby si vedela skontrolovať, ktorý byt to bol</span></summary>
 <div class="scroll"><table id="evt"><thead><tr><th>Dátum</th><th class="l">Udalosť</th><th class="l">Byt</th><th class="l">Overenie / poznámka</th></tr></thead><tbody></tbody></table></div></details>
+<details class="card" id="mgbox" style="margin-top:16px"><summary><b>Spojené inzeráty</b> (<span id="mgn">0</span>) <span class="sub" style="display:inline;margin:0">tie, ktoré som zlúčila ako jeden byt, skontroluj</span></summary>
+<p class="sub" style="margin-top:8px">Sem patria inzeráty, ktoré vyzerali ako ten istý byt (rovnaká dispozícia, plocha, ulica, cena a podobný text). Ak ide o dva rôzne byty, pridaj ID druhého inzerátu na nový riadok do súboru <code>data/no_merge.txt</code> v repozitári. Pri ďalšom behu sa byty rozdelia a už sa nespoja.</p>
+<div id="mglist"></div></details>
 <details><summary>Tabuľka po dňoch</summary><div class="scroll">
 <table id="tbl"><thead><tr><th>Dátum</th><th>Aktívne</th><th>Nové</th><th>Zmizli</th></tr></thead><tbody></tbody></table></div></details>
 <p class="note" id="note"></p>
@@ -557,11 +627,12 @@ const fmt = n => n == null ? '–' : String(Math.round(n * 10) / 10).replace('.'
 const store = {get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
                set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }};
 const T = D.updated, CUT = addD(T, -D.gone_after);
-const F = D.flats.map(r => ({first: r[0], last: r[1], lay: lab(r[2]), area: r[3], p: r[4], init: r[5], url: r[6], street: r[7], en: r[8], ea: r[9], pk: r[10], snap: r[11]}));
+const F = D.flats.map(r => ({first: r[0], last: r[1], lay: lab(r[2]), area: r[3], p: r[4], init: r[5], url: r[6], street: r[7], en: r[8], ea: r[9], pk: r[10], snap: r[11], cd: r[12]}));
 const total = f => !f.p ? null : (f.en === 'incl' ? f.p : (f.en === 'sep' && f.ea ? f.p + f.ea : null));
 const rentOnly = f => (f.p && (f.en === 'sep' || f.en === 'sep?')) ? f.p : null;
 const pr = f => $('pm').value === 'rent' ? rentOnly(f) : total(f);
 const pkTxt = f => ({yes: 'áno', extra: 'za príplatok', street: 'pred domom / možné'}[f.pk] || '–');
+const cdTxt = f => ({new: 'novostavba', full: 'kompletná rekonštr.', partial: 'čiastočná rekonštr.', reko: 'po rekonštr.', orig: 'pôvodný stav'}[f.cd] || '–');
 const enTxt = f => f.en === 'incl' ? 'v cene' : (f.en === 'sep' ? '+' + f.ea + ' €' : (f.en === 'sep?' ? 'zvlášť (?)' : '?'));
 let charts = [];
 
@@ -604,13 +675,27 @@ function make(id, boxId, type, labels, sets, minPoints, legend) {
   }));
 }
 
+function renderMerged() {
+  $('mgn').textContent = D.merged.length;
+  $('mglist').innerHTML = D.merged.length ? D.merged.map(m => {
+    const f = F[m[0]], link = u => /^https:\/\//.test(u) ? '<a href="' + esc(u) + '" target="_blank" rel="noopener">' : '';
+    const head = esc(f.lay) + ' · ' + esc(f.street || '—') + ' · ' + (f.area == null ? '?' : esc(f.area)) + ' m² · ' + (f.p ? esc(f.p) + ' €' : '?');
+    const alts = m[1].map(a => '<li>' + link(a.url) + 'inzerát ' + esc(a.id) + (link(a.url) ? '</a>' : '') + ' · ' +
+      (a.area ? esc(a.area) + ' m² · ' : '') + (a.price ? esc(a.price) + ' € · ' : '') + 'spojený ' + esc(a.date) + ' · zhoda ' + esc(a.sc) +
+      (a.sc >= 8 ? ' (istá)' : ' (menej istá)') + (a.snap ? '<br><span class="sub">' + esc(a.snap) + '</span>' : '') + '</li>').join('');
+    return '<p style="margin:10px 0 2px"><b>' + (link(f.url) ? link(f.url) + head + '</a>' : head) + '</b></p><ul style="margin:0 0 8px">' + alts + '</ul>';
+  }).join('') : '<p class="sub">Zatiaľ nebol spojený žiadny inzerát.</p>';
+}
+
 function refresh() {
   charts.forEach(c => c.destroy()); charts = [];
   ['b1', 'b2', 'b3', 'b4'].forEach((b, i) => { $(b).innerHTML = '<canvas id="c' + (i + 1) + '"></canvas>'; });
   const [from, to] = range(), L = $('lay').value;
   const PK = $('pkf').value;
   const base = F.filter(f => !L || f.lay === L);
-  const sel = base.filter(f => !PK || (PK === 'no' ? (f.pk !== 'yes' && f.pk !== 'extra') : f.pk === PK));
+  const CD = $('cdf').value;
+  const sel = base.filter(f => !PK || (PK === 'no' ? (f.pk !== 'yes' && f.pk !== 'extra') : f.pk === PK))
+                  .filter(f => !CD || (CD === 'none' ? !f.cd : f.cd === CD));
   const span = diff(from, to) + 1, daily = span <= 45;
 
   const days = [], idx = {};
@@ -714,13 +799,14 @@ function refresh() {
     const link = ok ? '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" title="' + esc(r.snap) + '">' : '';
     return '<tr><td>' + (ok ? link + esc(r.lay) + '</a>' : esc(r.lay)) + '</td><td class="l">' + esc(r.street) + '</td><td>' +
       esc(r.area == null ? '' : r.area) + '</td><td>' + (r.p ? esc(r.p) + ' €' : '') + '</td><td>' + esc(enTxt(r)) + '</td><td>' +
-      (total(r) ? esc(total(r)) + ' €' : '–') + '</td><td>' + esc(pkTxt(r)) + '</td><td>' +
+      (total(r) ? esc(total(r)) + ' €' : '–') + '</td><td>' + esc(pkTxt(r)) + '</td><td>' + esc(cdTxt(r)) + '</td><td>' +
       (gone ? r.last : r.first) + '</td><td>' + (ok ? link + 'otvoriť</a>' : '') + '</td></tr>';
-  }).join('') : '<tr><td colspan="9">Žiadne inzeráty.</td></tr>';
+  }).join('') : '<tr><td colspan="10">Žiadne inzeráty.</td></tr>';
 
   const EVT = {new: 'Nový inzerát', gone: 'Zmizol z ponuky', rented: 'Potvrdený ako obsadený', price: 'Zmena ceny',
                relist: 'Obnovený inzerát (nové ID)', back: 'Znovu v ponuke'};
   const selSet = new Set(sel);
+  renderMerged();
   const evs = D.events.filter(e => e[0] >= from && e[0] <= to && selSet.has(F[e[2]]));
   $('evn').textContent = evs.length;
   $('evt').querySelector('tbody').innerHTML = evs.length ? evs.map(e => {
@@ -743,6 +829,7 @@ function refresh() {
 $('per').addEventListener('change', () => { $('cust').hidden = $('per').value !== 'custom'; store.set('per', $('per').value); refresh(); });
 $('lay').addEventListener('change', () => { store.set('lay', $('lay').value); refresh(); });
 $('pkf').addEventListener('change', refresh);
+$('cdf').addEventListener('change', refresh);
 $('tiles').addEventListener('click', e => {
   const b = e.target.closest('[data-w]'); if (!b) return;
   document.querySelector('input[name=w][value=' + b.dataset.w + ']').checked = true;
