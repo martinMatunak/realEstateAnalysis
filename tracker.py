@@ -40,7 +40,15 @@ DAILY_FIELDS = ["date", "active", "new", "gone"]
 PRICE_FIELDS = ["date", "flat_id", "price"]
 EVENT_FIELDS = ["date", "type", "flat_id", "note"]
 MAX_CHECKS = 15          # najviac tolko starých inzerátov sa pri jednom behu ide overiť
-ID_RE = re.compile(r"/detail/([A-Za-z0-9]+)")
+ID_RE = re.compile(r"(?:/detail/([A-Za-z0-9]+)|^(?:https?://[^/]+)?/(\d{6,10})(?:[/?#]|$))")  # /detail/ID alebo /1234567/slug
+
+
+def lid_of(href):
+    m = ID_RE.search(href or "")
+    return (m.group(1) or m.group(2)) if m else None
+
+
+DIAG = {"pages": [], "skipped": []}      # diagnostika posledného behu (zobrazí sa na stránke)
 LOC_RE = re.compile(r"Bratislava\s*-\s*Dev[ií]nska", re.I)   # adresa inzerátu musí byť v DNV
 SKIPPED = [0]                                                  # počet inzerátov z inej lokality
 STOP = {"bratislava", "devínska", "devinska", "nová", "nova", "okres", "prenájom",
@@ -48,14 +56,25 @@ STOP = {"bratislava", "devínska", "devinska", "nová", "nova", "okres", "prená
 
 
 # ---------------------------------------------------------------- stiahnutie
-def fetch(kind, page):
+def next_url(html, page):
+    """Nájde v stránke skutočný odkaz na ďalšiu stranu; inak vráti None."""
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.find_all("a", href=True):
+        h = a["href"]
+        if re.search(r"[?&](?:p%5Bpage%5D|p\[page\]|page)=" + str(page + 1) + r"(?:&|$)", h):
+            return BASE + h if h.startswith("/") else h
+    return None
+
+
+def fetch(kind, page, url=None):
     fixture = os.environ.get("TRACKER_FIXTURE_DIR")
     if fixture:
-        p = Path(fixture) / f"{kind}.html"
-        return p.read_text(encoding="utf-8") if (p.exists() and page == 1) else None
-    url = f"{BASE}/vysledky/{kind}/{AREA}"
-    if page > 1:
-        url += f"?p[page]={page}"
+        p = Path(fixture) / (f"{kind}.html" if page == 1 else f"{kind}_{page}.html")
+        return p.read_text(encoding="utf-8") if p.exists() else None
+    if not url:
+        url = f"{BASE}/vysledky/{kind}/{AREA}"
+        if page > 1:
+            url += f"?p[page]={page}"
     r = requests.get(url, headers=HEADERS, timeout=30)
     if r.status_code == 404:
         return None
@@ -182,7 +201,7 @@ def parse(html):
     soup = BeautifulSoup(html, "html.parser")
     found, urls, titles = {}, {}, {}
     for a in soup.find_all("a", href=ID_RE):
-        lid = ID_RE.search(a["href"]).group(1)
+        lid = lid_of(a["href"])
         href = a["href"].split("?")[0].split("#")[0]
         urls.setdefault(lid, BASE + href if href.startswith("/") else href)
         label = " ".join(a.get_text(" ", strip=True).split())
@@ -191,7 +210,7 @@ def parse(html):
         node = a
         # kartu = najväčší predok, ktorý obsahuje odkazy len na jeden inzerát
         while node.parent is not None and node.parent.name not in ("body", "html", "[document]"):
-            ids = {ID_RE.search(x["href"]).group(1)
+            ids = {lid_of(x["href"])
                    for x in node.parent.find_all("a", href=ID_RE)}
             if len(ids) > 1:
                 break
@@ -199,6 +218,8 @@ def parse(html):
         text = " ".join(node.get_text(" ", strip=True).split())
         if not LOC_RE.search(text):      # odporúčané/sponzorované inzeráty z iných častí mesta
             SKIPPED[0] += 1
+            if len(DIAG["skipped"]) < 40:
+                DIAG["skipped"].append([lid, urls.get(lid, ""), text[:220]])
             continue
         item = parse_text(lid, text)
         if lid not in found or score(item) > score(found[lid]):
@@ -212,18 +233,22 @@ def scrape():
     items, raw = {}, []
     for kind in KINDS:
         seen_before = set()
+        url = None
         for page in range(1, MAX_PAGES + 1):
-            html = fetch(kind, page)
+            html = fetch(kind, page, url)
             if not html:
                 break
             raw.append(html)
             got = parse(html)
             new_ids = {i["id"] for i in got} - seen_before
+            nxt = next_url(html, page)
+            DIAG["pages"].append([kind, page, len(got), len(new_ids), "odkaz" if url else ("hádaný" if page > 1 else "")])
+            url = nxt
             seen_before |= new_ids
             for it in got:
                 if it["id"] not in items or score(it) > score(items[it["id"]]):
                     items[it["id"]] = it
-            if not new_ids or len(got) < 15:
+            if not new_ids or (len(got) < 15 and not nxt):
                 break
     if not items:
         DEBUG.mkdir(exist_ok=True)
@@ -322,12 +347,12 @@ def find_match(it, fp, flats, today, present, claimed):
 
 def check_listing(url):
     """Pozrie starý inzerát a vráti krátky popis stavu."""
-    m = ID_RE.search(url or "")
-    if not m:
+    lid = lid_of(url)
+    if not lid:
         return "inzerát nemá odkaz"
     fixture = os.environ.get("TRACKER_FIXTURE_DIR")
     if fixture:
-        p = Path(fixture) / f"detail_{m.group(1)}.html"
+        p = Path(fixture) / f"detail_{lid}.html"
         if not p.exists():
             return "stránka inzerátu už neexistuje (404)"
         html = p.read_text(encoding="utf-8")
@@ -528,6 +553,7 @@ def build_data(flats, daily, today, events):
         "updated": today.isoformat(),
         "start": daily[0]["date"] if daily else today.isoformat(),
         "gone_after": GONE_AFTER_DAYS,
+        "diag": DIAG,
         "merges": {"n": len(scores), "weak": sum(1 for s in scores if s < MATCH_SURE)},
         # [prvýkrát, naposledy, dispozícia, m², nájom, počiatočný(1/0), odkaz, ulica, energie, suma energií, parkovanie, text z posledného videnia, stav]
         "flats": [[f["first_seen"], f["last_seen"], f["layout"], num(f["area"]), num(f["price_last"]),
@@ -608,6 +634,8 @@ button.tile:hover{border-color:var(--s1)}summary{cursor:pointer}details.card sum
 <details class="card" id="mgbox" style="margin-top:16px"><summary><b>Spojené inzeráty</b> (<span id="mgn">0</span>) <span class="sub" style="display:inline;margin:0">tie, ktoré som zlúčila ako jeden byt, skontroluj</span></summary>
 <p class="sub" style="margin-top:8px">Sem patria inzeráty, ktoré vyzerali ako ten istý byt (rovnaká dispozícia, plocha, ulica, cena a podobný text). Ak ide o dva rôzne byty, pridaj ID druhého inzerátu na nový riadok do súboru <code>data/no_merge.txt</code> v repozitári. Pri ďalšom behu sa byty rozdelia a už sa nespoja.</p>
 <div id="mglist"></div></details>
+<details class="card" id="dgbox" style="margin-top:16px"><summary><b>Diagnostika posledného behu</b> <span class="sub" style="display:inline;margin:0">koľko inzerátov sa našlo na ktorej strane a čo sa preskočilo</span></summary>
+<div id="dglist" class="sub" style="margin-top:8px"></div></details>
 <details><summary>Tabuľka po dňoch</summary><div class="scroll">
 <table id="tbl"><thead><tr><th>Dátum</th><th>Aktívne</th><th>Nové</th><th>Zmizli</th></tr></thead><tbody></tbody></table></div></details>
 <p class="note" id="note"></p>
@@ -677,6 +705,13 @@ function make(id, boxId, type, labels, sets, minPoints, legend) {
 
 function renderMerged() {
   $('mgn').textContent = D.merged.length;
+  (function(){
+    const g = D.diag || {pages: [], skipped: []}, esc = t => String(t).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+    let h = '<p>Strany: ' + (g.pages.map(p => esc(p[0]) + ' s.' + p[1] + ': ' + p[2] + ' (nových ' + p[3] + (p[4] ? ', ' + p[4] : '') + ')').join(' · ') || 'nič') + '</p>';
+    h += '<p>Preskočené (iná lokalita): ' + g.skipped.length + '</p>';
+    h += g.skipped.map(x => '<p><a href="' + esc(x[1]) + '" target="_blank" rel="noopener">' + esc(x[0]) + '</a> ' + esc(x[2]) + '</p>').join('');
+    $('dglist').innerHTML = h;
+  })();
   $('mglist').innerHTML = D.merged.length ? D.merged.map(m => {
     const f = F[m[0]], link = u => /^https:\/\//.test(u) ? '<a href="' + esc(u) + '" target="_blank" rel="noopener">' : '';
     const head = esc(f.lay) + ' · ' + esc(f.street || '—') + ' · ' + (f.area == null ? '?' : esc(f.area)) + ' m² · ' + (f.p ? esc(f.p) + ' €' : '?');
