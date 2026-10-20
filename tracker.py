@@ -48,8 +48,9 @@ def lid_of(href):
     return (m.group(1) or m.group(2)) if m else None
 
 
-DIAG = {"pages": [], "skipped": []}      # diagnostika posledného behu (zobrazí sa na stránke)
+DIAG = {"pages": [], "skipped": [], "check": []}      # diagnostika posledného behu (zobrazí sa na stránke)
 LOC_RE = re.compile(r"Dev[ií]nska\s+Nov[aá]\s+Ves", re.I)   # adresa inzerátu musí byť v DNV
+OKRES_RE = re.compile(r"okres\s+[A-ZÁ-Ž][\w-]*(?:\s+[IVX]+\b)?")
 SKIPPED = [0]                                                  # počet inzerátov z inej lokality
 STOP = {"bratislava", "devínska", "devinska", "nová", "nova", "okres", "prenájom",
         "prenajom", "mesiac", "izbový", "izbovy", "izbov", "email", "telefón"}
@@ -216,6 +217,12 @@ def parse(html):
                 break
             node = node.parent
         text = " ".join(node.get_text(" ", strip=True).split())
+        ok = [m for m in OKRES_RE.finditer(text)]
+        if ok:       # prvá lokalita v karte musí byť DNV; všetko za ňou (cudzie reklamy) sa odreže
+            if not LOC_RE.search(text[max(0, ok[0].start() - 70):ok[0].end()]):
+                text = ""
+            else:
+                text = text[:ok[0].end() + 40]
         if not LOC_RE.search(text):      # odporúčané/sponzorované inzeráty z iných častí mesta
             SKIPPED[0] += 1
             if len(DIAG["skipped"]) < 40:
@@ -234,6 +241,7 @@ def scrape():
     for kind in KINDS:
         seen_before = set()
         url = None
+        total = {}
         for page in range(1, MAX_PAGES + 1):
             html = fetch(kind, page, url)
             if not html:
@@ -242,6 +250,9 @@ def scrape():
             got = parse(html)
             new_ids = {i["id"] for i in got} - seen_before
             nxt = next_url(html, page)
+            if page == 1:
+                m = re.search(r"(\d[\d\s\u00a0]{0,5}?)\s*nehnuteľnos", BeautifulSoup(html, "html.parser").get_text(" "))
+                total[kind] = int(re.sub(r"\D", "", m.group(1))) if m else None
             DIAG["pages"].append([kind, page, len(got), len(new_ids), "odkaz" if url else ("hádaný" if page > 1 else "")])
             url = nxt
             seen_before |= new_ids
@@ -250,6 +261,9 @@ def scrape():
                     items[it["id"]] = it
             if not new_ids or (len(got) < 15 and not nxt):
                 break
+        DIAG["check"].append([kind, total.get(kind), len(seen_before)])
+        if total.get(kind) is not None and total[kind] != len(seen_before):
+            print(f"POZOR: {kind}: stránka uvádza {total[kind]} nehnuteľností, ale našla som {len(seen_before)}")
     if not items:
         DEBUG.mkdir(exist_ok=True)
         if raw:
@@ -708,6 +722,7 @@ function renderMerged() {
   (function(){
     const g = D.diag || {pages: [], skipped: []}, esc = t => String(t).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
     let h = '<p>Strany: ' + (g.pages.map(p => esc(p[0]) + ' s.' + p[1] + ': ' + p[2] + ' (nových ' + p[3] + (p[4] ? ', ' + p[4] : '') + ')').join(' · ') || 'nič') + '</p>';
+    h += '<p>Kontrola počtu (stránka uvádza / našla som): ' + ((g.check || []).map(c => esc(c[0]) + ' ' + (c[1] === null ? '?' : c[1]) + ' / ' + c[2] + (c[1] !== null && c[1] !== c[2] ? ' ⚠' : ' ✓')).join(' · ') || 'nič') + '</p>';
     h += '<p>Preskočené (iná lokalita): ' + g.skipped.length + '</p>';
     h += g.skipped.map(x => '<p><a href="' + esc(x[1]) + '" target="_blank" rel="noopener">' + esc(x[0]) + '</a> ' + esc(x[2]) + '</p>').join('');
     $('dglist').innerHTML = h;
