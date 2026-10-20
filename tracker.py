@@ -50,6 +50,7 @@ def lid_of(href):
 
 DIAG = {"pages": [], "skipped": []}      # diagnostika posledného behu (zobrazí sa na stránke)
 LOC_RE = re.compile(r"Bratislava\s*-\s*Dev[ií]nska", re.I)   # adresa inzerátu musí byť v DNV
+OTHER_RE = re.compile(r"Bratislava\s*-\s*(?!Dev[ií]nska)[A-ZÁ-Ž]|Bratislava\s+[IV]+\b|Senec|Pezinok|Stupava|Záhorská Bystrica")  # inzerát z inej lokality
 SKIPPED = [0]                                                  # počet inzerátov z inej lokality
 STOP = {"bratislava", "devínska", "devinska", "nová", "nova", "okres", "prenájom",
         "prenajom", "mesiac", "izbový", "izbovy", "izbov", "email", "telefón"}
@@ -216,7 +217,7 @@ def parse(html):
                 break
             node = node.parent
         text = " ".join(node.get_text(" ", strip=True).split())
-        if not LOC_RE.search(text):      # odporúčané/sponzorované inzeráty z iných častí mesta
+        if not LOC_RE.search(text) and OTHER_RE.search(text):      # odporúčané/sponzorované inzeráty z iných častí mesta
             SKIPPED[0] += 1
             if len(DIAG["skipped"]) < 40:
                 DIAG["skipped"].append([lid, urls.get(lid, ""), text[:220]])
