@@ -181,8 +181,8 @@ def parse_text(lid, text):
             layout = "1" if g.lower().startswith("gars") else g.replace(",", ".")
     street = ""
     U, L = "A-ZÁÄČĎÉÍĹĽŇÓÔŔŠŤÚÝŽ", "a-záäčďéíĺľňóôŕšťúýž"
-    m = re.search(rf"((?:[{U}][{L}.\-]+\s+){{0,2}}[{U}][{L}.\-]+(?:\s+\d+[A-Za-z/]*)?)"
-                  r"\s*,\s*(?:Bratislava\s*-\s*)?Devínska Nová Ves", text)
+    m = re.search(rf"((?:[{U}][{L}.\-]+\s+){{0,2}}[{U}][{L}.\-]+(?:\s+\d+[A-Za-z0-9/]*)?)"
+                  r"(?:\s*\([^)]*\))?\s*,\s*(?:Bratislava\s*-\s*)?Devínska Nová Ves", text)
     if m:
         street = m.group(1).strip()
     head = text[:120].lower()
@@ -357,6 +357,64 @@ def find_match(it, fp, flats, today, present, claimed):
         if s is not None and s >= need and (best_f is None or s > best_s):
             best_s, best_f = s, f
     return best_f, best_s
+
+
+DETAIL_MAX = 60           # najviac toľko detailov sa stiahne pri jednom behu
+DETAIL_TTL = 21           # po koľkých dňoch sa detail znova prečíta
+
+
+def detail_text(html):
+    soup = BeautifulSoup(html, "html.parser")
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    t = " ".join(soup.get_text(" ", strip=True).split())
+    i = t.find("Popis")
+    t = t[i:i + 6000] if i >= 0 else t[:6000]
+    # hlavička „530 €/mes. s energiami“ býva v rozpore s popisom, preto sa ignoruje
+    return re.sub(r"\d[\d\s]*€\s*/\s*mes\.?\s*s\s+energi\w*", " ", t)
+
+
+def enrich(items, today):
+    """Z detailu inzerátu doplní energie, parkovanie a stav (v zozname karty ich nie je)."""
+    path = DATA / "details.json"
+    try:
+        cache = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except ValueError:
+        cache = {}
+    fixture = os.environ.get("TRACKER_FIXTURE_DIR")
+    n = ok = 0
+    for it in items:
+        c = cache.get(it["id"])
+        if c and (today - date.fromisoformat(c["d"])).days < DETAIL_TTL:
+            pass
+        elif n < DETAIL_MAX and it.get("url"):
+            n += 1
+            html = None
+            try:
+                if fixture:
+                    f = Path(fixture) / f"detail_{it['id']}.html"
+                    html = f.read_text(encoding="utf-8") if f.exists() else None
+                else:
+                    r = requests.get(it["url"], headers=HEADERS, timeout=30)
+                    time.sleep(2)
+                    html = r.text if r.status_code == 200 else None
+            except requests.RequestException:
+                html = None
+            if html:
+                t = detail_text(html)
+                en, ea = parse_energy(t)
+                c = {"d": today.isoformat(), "energy": en, "energy_amt": ea,
+                     "parking": parse_parking(t), "cond": parse_condition(t)}
+                cache[it["id"]] = c
+        if c:
+            ok += 1
+            it["energy"], it["energy_amt"], it["parking"] = c["energy"], c["energy_amt"], c["parking"]
+            if c["cond"]:
+                it["cond"] = c["cond"]
+    DATA.mkdir(exist_ok=True)
+    path.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    DIAG["detail"] = [n, ok, len(items)]
+    print(f"detaily: stiahnutých {n}, doplnených {ok} z {len(items)}")
 
 
 def check_listing(url):
@@ -723,6 +781,7 @@ function renderMerged() {
     const g = D.diag || {pages: [], skipped: []}, esc = t => String(t).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
     let h = '<p>Strany: ' + (g.pages.map(p => esc(p[0]) + ' s.' + p[1] + ': ' + p[2] + ' (nových ' + p[3] + (p[4] ? ', ' + p[4] : '') + ')').join(' · ') || 'nič') + '</p>';
     h += '<p>Kontrola počtu (stránka uvádza / našla som): ' + ((g.check || []).map(c => esc(c[0]) + ' ' + (c[1] === null ? '?' : c[1]) + ' / ' + c[2] + (c[1] !== null && c[1] !== c[2] ? ' ⚠' : ' ✓')).join(' · ') || 'nič') + '</p>';
+    h += '<p>Detaily (stiahnuté teraz / doplnené / spolu): ' + esc((g.detail || ['?']).join(' / ')) + '</p>';
     h += '<p>Preskočené (iná lokalita): ' + g.skipped.length + '</p>';
     h += g.skipped.map(x => '<p><a href="' + esc(x[1]) + '" target="_blank" rel="noopener">' + esc(x[0]) + '</a> ' + esc(x[2]) + '</p>').join('');
     $('dglist').innerHTML = h;
@@ -910,6 +969,7 @@ def main():
     items = scrape()
     if not items:
         sys.exit("CHYBA: nenašiel som žiadne inzeráty (blokovanie alebo zmena stránky). Dáta som nezmenil.")
+    enrich(items, today)
     prev_daily = read_csv(DATA / "daily.csv")
     prev_active = int(prev_daily[-1]["active"]) if prev_daily and prev_daily[-1]["date"] != today.isoformat() else 0
     if prev_active and len(items) < 0.5 * prev_active:
