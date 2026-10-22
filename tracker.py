@@ -51,6 +51,7 @@ def lid_of(href):
 DIAG = {"pages": [], "skipped": [], "check": []}      # diagnostika posledného behu (zobrazí sa na stránke)
 LOC_RE = re.compile(r"Dev[ií]nska\s+Nov[aá]\s+Ves", re.I)   # adresa inzerátu musí byť v DNV
 OKRES_RE = re.compile(r"okres\s+[A-ZÁ-Ž][\w-]*(?:\s+[IVX]+\b)?")
+COMM_RE = re.compile(r"komerčn|multifunk|\bpriestor(?:y|u|om|ov)?\b|kancelár|obchodn\w+\s+priestor|nebytov|skladov|sklad\b|reštaurác|prevádzk|garážov\w+\s+státie\s+na\s+prenájom|ordinác|showroom|výrobn|hala\b", re.I)
 SKIPPED = [0]                                                  # počet inzerátov z inej lokality
 STOP = {"bratislava", "devínska", "devinska", "nová", "nova", "okres", "prenájom",
         "prenajom", "mesiac", "izbový", "izbovy", "izbov", "email", "telefón"}
@@ -227,6 +228,11 @@ def parse(html):
             SKIPPED[0] += 1
             if len(DIAG["skipped"]) < 40:
                 DIAG["skipped"].append([lid, urls.get(lid, ""), text[:220]])
+            continue
+        if COMM_RE.search(titles.get(lid, "") + " " + text[:200]):   # komerčné priestory nie sú byty
+            SKIPPED[0] += 1
+            if len(DIAG["skipped"]) < 40:
+                DIAG["skipped"].append([lid, urls.get(lid, ""), "(komerčný) " + text[:200]])
             continue
         item = parse_text(lid, text)
         if lid not in found or score(item) > score(found[lid]):
@@ -465,6 +471,54 @@ def finish_events(flats, events, today):
     allv = [r for r in read_csv(DATA / "events.csv") if r["date"] != t] + events
     write_csv(DATA / "events.csv", EVENT_FIELDS, allv)
     return allv
+
+
+EXCLUDE_IDS = {"JuOvYGdou7w"}      # natvrdo vyradené inzeráty (ďalšie ID patria do data/exclude.txt)
+
+
+def load_exclude():
+    ex = set(EXCLUDE_IDS)
+    p = DATA / "exclude.txt"
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.split("#")[0].strip()
+            if line:
+                ex.add(lid_of(line) or line)
+    return ex
+
+
+def purge(ex):
+    """Vymaže z uložených dát všetko k vyradeným inzerátom a komerčným priestorom."""
+    flats = read_csv(DATA / "listings.csv")
+    marker = DATA / "purged_commercial.txt"
+    first = not marker.exists()      # kontrola komerčných priestorov podľa textu prebehne len raz
+    if first and flats:
+        marker.write_text("hotovo\n", encoding="utf-8")
+    if not flats:
+        return
+    bad = set()
+    for f in flats:
+        ids = set(f["ids"].split("|")) | {f["flat_id"]}
+        if ids & ex or (first and COMM_RE.search((f.get("title") or "") + " " + (f.get("snap") or "")[:200])):
+            bad.add(f["flat_id"])
+    if not bad:
+        return
+    write_csv(DATA / "listings.csv", FLAT_FIELDS, [f for f in flats if f["flat_id"] not in bad])
+    for name, fields in (("prices.csv", PRICE_FIELDS), ("events.csv", EVENT_FIELDS)):
+        rows = read_csv(DATA / name)
+        write_csv(DATA / name, fields, [r for r in rows if r["flat_id"] not in bad])
+    dp = DATA / "details.json"
+    if dp.exists():
+        try:
+            c = json.loads(dp.read_text(encoding="utf-8"))
+            for f in flats:
+                if f["flat_id"] in bad:
+                    for i in f["ids"].split("|"):
+                        c.pop(i, None)
+            dp.write_text(json.dumps(c, ensure_ascii=False), encoding="utf-8")
+        except ValueError:
+            pass
+    print(f"vyčistené dáta: odstránených {len(bad)} bytov (komerčné/vyradené)")
 
 
 def load_no_merge():
@@ -966,7 +1020,9 @@ def main():
     tz = ZoneInfo("Europe/Bratislava")
     today = (date.fromisoformat(os.environ["TRACKER_TODAY"])
              if os.environ.get("TRACKER_TODAY") else datetime.now(tz).date())
-    items = scrape()
+    ex = load_exclude()
+    purge(ex)
+    items = [i for i in scrape() if i["id"] not in ex]
     if not items:
         sys.exit("CHYBA: nenašiel som žiadne inzeráty (blokovanie alebo zmena stránky). Dáta som nezmenil.")
     enrich(items, today)
