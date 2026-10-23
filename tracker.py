@@ -105,7 +105,7 @@ def parse_energy(text):
     t = text.lower()
     amt = None
     m = (re.search(r"(?:energi\w*|zálohy?|služb\w*|poplatk\w*)\s*[:\-]?\s*(?:cca\s*|vo výške\s*)?(\d{2,3})\s*(?:€|eur)", t) or
-         re.search(r"(\d{2,3})\s*(?:€|eur\w*)\s*(?:/\s*mes\w*\s*)?(?:za\s+|na\s+|ako\s+)?"
+         re.search(r"(\d{2,3})\s*(?:€|eur\w*)\s*(?:/\s*mes\w*\.?\s*)?(?:za\s+|na\s+|ako\s+)?"
                    r"(?:zálohy?\s+(?:na\s+|za\s+)?)?(?:energi|poplat|služb)", t))
     if m and 20 <= int(m.group(1)) <= 600:
         amt = int(m.group(1))
@@ -374,10 +374,16 @@ def detail_text(html):
     for t in soup(["script", "style", "noscript"]):
         t.decompose()
     t = " ".join(soup.get_text(" ", strip=True).split())
-    i = t.find("Popis")
-    t = t[i:i + 6000] if i >= 0 else t[:6000]
+    t = t[:7000]       # hlavička s cenou a energiami je pred popisom
     # hlavička „530 €/mes. s energiami“ býva v rozpore s popisom, preto sa ignoruje
     return re.sub(r"\d[\d\s]*€\s*/\s*mes\.?\s*s\s+energi\w*", " ", t)
+
+
+def detail_cond(t):
+    """Štítok „Novostavba“ v parametroch inzerátu má prednosť pred zmienkami v texte."""
+    if re.search(r"(?<![\w-])Novostavba(?![\w])", t[:3000]):
+        return "new"
+    return parse_condition(t[:4000])
 
 
 def enrich(items, today):
@@ -391,7 +397,7 @@ def enrich(items, today):
     n = ok = 0
     for it in items:
         c = cache.get(it["id"])
-        if c and (today - date.fromisoformat(c["d"])).days < DETAIL_TTL:
+        if c and c.get("v") == 3 and (today - date.fromisoformat(c["d"])).days < DETAIL_TTL:
             pass
         elif n < DETAIL_MAX and it.get("url"):
             n += 1
@@ -409,8 +415,8 @@ def enrich(items, today):
             if html:
                 t = detail_text(html)
                 en, ea = parse_energy(t)
-                c = {"d": today.isoformat(), "energy": en, "energy_amt": ea,
-                     "parking": parse_parking(t), "cond": parse_condition(t)}
+                c = {"v": 3, "d": today.isoformat(), "energy": en, "energy_amt": ea,
+                     "parking": parse_parking(t), "cond": detail_cond(t)}
                 cache[it["id"]] = c
         if c:
             ok += 1
