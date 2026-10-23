@@ -105,7 +105,7 @@ def parse_energy(text):
     t = text.lower()
     amt = None
     m = (re.search(r"(?:energi\w*|zálohy?|služb\w*|poplatk\w*)\s*[:\-]?\s*(?:cca\s*|vo výške\s*)?(\d{2,3})\s*(?:€|eur)", t) or
-         re.search(r"(\d{2,3})\s*(?:€|eur\w*)\s*(?:/\s*mes\w*\.?\s*)?(?:za\s+|na\s+|ako\s+)?"
+         re.search(r"(\d{2,3})[,.]?-?\s*(?:€|eur\w*)\s*(?:/\s*mes\w*\.?\s*)?(?:za\s+|na\s+|ako\s+)?"
                    r"(?:zálohy?\s+(?:na\s+|za\s+)?)?(?:energi|poplat|služb)", t))
     if m and 20 <= int(m.group(1)) <= 600:
         amt = int(m.group(1))
@@ -130,6 +130,8 @@ def parse_parking(text):
     t = text.lower()
     if re.search(r"bez\s+(?:vlastn\w+\s+)?(?:parkov|garáž|parking|stát[ií]a)", t):
         return ""
+    if re.search(r"nepatr\w*[^.]{0,50}(?:parkov|garáž|stát)|(?:parkov|garáž|stát)[^.]{0,40}nepatr|nie\s+je\s+(?:súčasť|k\s+dispozícii)[^.]{0,40}parkov|žiadne\s+(?:vlastné\s+)?parkov", t):
+        return "street" if "verejn" in t else ""
     ded = re.search(r"parkovac\w+\s+(?:miest|stát[ií]|stan)|garáž|garaz|stát[ií]|stání|parking|vlastn\w+\s+parkov", t)
     if not (ded or re.search(r"parkov", t)):
         return ""
@@ -369,6 +371,16 @@ DETAIL_MAX = 60           # najviac toľko detailov sa stiahne pri jednom behu
 DETAIL_TTL = 21           # po koľkých dňoch sa detail znova prečíta
 
 
+def script_text(html):
+    """Text z JSON skriptov stránky (__NEXT_DATA__, ld+json) – záloha, keď je údaj len tam."""
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
+    for sc in soup.find_all("script"):
+        if sc.get("id") == "__NEXT_DATA__" or "json" in (sc.get("type") or ""):
+            out.append((sc.string or sc.get_text() or "")[:20000])
+    return " ".join(out).replace('\\"', '"')
+
+
 def detail_text(html):
     soup = BeautifulSoup(html, "html.parser")
     for t in soup(["script", "style", "noscript"]):
@@ -397,7 +409,7 @@ def enrich(items, today):
     n = ok = 0
     for it in items:
         c = cache.get(it["id"])
-        if c and c.get("v") == 3 and (today - date.fromisoformat(c["d"])).days < DETAIL_TTL:
+        if c and c.get("v") == 5 and (today - date.fromisoformat(c["d"])).days < DETAIL_TTL:
             pass
         elif n < DETAIL_MAX and it.get("url"):
             n += 1
@@ -415,7 +427,11 @@ def enrich(items, today):
             if html:
                 t = detail_text(html)
                 en, ea = parse_energy(t)
-                c = {"v": 3, "d": today.isoformat(), "energy": en, "energy_amt": ea,
+                if not en:       # záloha: údaj môže byť len v JSON skripte stránky
+                    en, ea = parse_energy(script_text(html))
+                if len(DIAG.setdefault("samples", [])) < 6:
+                    DIAG["samples"].append([it["url"], len(t), en, ea, t[:260]])
+                c = {"v": 5, "d": today.isoformat(), "energy": en, "energy_amt": ea,
                      "parking": parse_parking(t), "cond": detail_cond(t)}
                 cache[it["id"]] = c
         if c:
@@ -842,6 +858,7 @@ function renderMerged() {
     let h = '<p>Strany: ' + (g.pages.map(p => esc(p[0]) + ' s.' + p[1] + ': ' + p[2] + ' (nových ' + p[3] + (p[4] ? ', ' + p[4] : '') + ')').join(' · ') || 'nič') + '</p>';
     h += '<p>Kontrola počtu (stránka uvádza / našla som): ' + ((g.check || []).map(c => esc(c[0]) + ' ' + (c[1] === null ? '?' : c[1]) + ' / ' + c[2] + (c[1] !== null && c[1] !== c[2] ? ' ⚠' : ' ✓')).join(' · ') || 'nič') + '</p>';
     h += '<p>Detaily (stiahnuté teraz / doplnené / spolu): ' + esc((g.detail || ['?']).join(' / ')) + '</p>';
+    h += (g.samples || []).map(x => '<p><a href="' + esc(x[0]) + '" target="_blank" rel="noopener">detail</a> dĺžka ' + x[1] + ', energie ' + esc(x[2]) + ' ' + esc(x[3]) + '<br>' + esc(x[4]) + '</p>').join('');
     h += '<p>Preskočené (iná lokalita): ' + g.skipped.length + '</p>';
     h += g.skipped.map(x => '<p><a href="' + esc(x[1]) + '" target="_blank" rel="noopener">' + esc(x[0]) + '</a> ' + esc(x[2]) + '</p>').join('');
     $('dglist').innerHTML = h;
