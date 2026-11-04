@@ -225,7 +225,8 @@ def parse(html):
             if not LOC_RE.search(text[max(0, ok[0].start() - 70):ok[0].end()]):
                 text = ""
             else:
-                text = text[:ok[0].end() + 40]
+                if len(ok) > 1:      # odreže až cudziu reklamu za kartou; cena a m² stoja ZA lokalitou
+                    text = text[:max(ok[0].end() + 40, ok[1].start() - 60)]
         if not LOC_RE.search(text):      # odporúčané/sponzorované inzeráty z iných častí mesta
             SKIPPED[0] += 1
             if len(DIAG["skipped"]) < 40:
@@ -966,8 +967,9 @@ function refresh() {
   if (cur.m != null) {
     verdict = cur.m < LIM.tight ? 'Nedostatok bytov' : (cur.m > LIM.loose ? 'Prebytok bytov' : 'Vyvážený trh');
     pos = Math.min(cur.m, 4) / 4 * 100;
+    if (cur.g < 5) { verdict = 'Zatiaľ málo dát'; pos = null; }
     detail = 'V ponuke je ' + cur.n + ' bytov a obsadzuje sa ich asi ' + fmt(cur.rate) + ' za 30 dní. Pri tomto tempe by ponuka vystačila na ' + fmt(cur.m) + ' mes.';
-    if (cur.g < 5) detail += ' Zmizlo však len ' + cur.g + ' bytov, takže ber to ako veľmi orientačné.';
+    if (cur.g < 5) detail += ' Zmizlo však len ' + cur.g + ' bytov, to je na verdikt málo (treba aspoň 5), preto ho zatiaľ neurčujem.';
     if (prev && prev.m != null) detail += ' Oproti predchádzajúcemu rovnako dlhému obdobiu ' +
       (cur.m > prev.m * 1.15 ? 'zásoba rastie (ponuka sa nasycuje).' : (cur.m < prev.m * 0.85 ? 'zásoba klesá (trh sa uťahuje).' : 'sa nič výrazné nezmenilo.'));
   }
