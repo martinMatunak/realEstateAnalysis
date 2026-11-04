@@ -40,7 +40,7 @@ DAILY_FIELDS = ["date", "active", "new", "gone"]
 PRICE_FIELDS = ["date", "flat_id", "price"]
 EVENT_FIELDS = ["date", "type", "flat_id", "note"]
 MAX_CHECKS = 15          # najviac tolko starých inzerátov sa pri jednom behu ide overiť
-ID_RE = re.compile(r"(?:/detail/([A-Za-z0-9]+)|^(?:https?://[^/]+)?/(\d{6,10})(?:[/?#]|$))")  # /detail/ID alebo /1234567/slug
+ID_RE = re.compile(r"(?:/detail/([A-Za-z0-9_-]+)|^(?:https?://[^/]+)?/(\d{6,10})(?:[/?#]|$))")  # /detail/ID alebo /1234567/slug
 
 
 def lid_of(href):
@@ -131,7 +131,7 @@ def parse_parking(text):
     if re.search(r"bez\s+(?:vlastn\w+\s+)?(?:parkov|garáž|parking|stát[ií]a)", t):
         return ""
     if re.search(r"nepatr\w*[^.]{0,50}(?:parkov|garáž|stát)|(?:parkov|garáž|stát)[^.]{0,40}nepatr|nie\s+je\s+(?:súčasť|k\s+dispozícii)[^.]{0,40}parkov|žiadne\s+(?:vlastné\s+)?parkov", t):
-        return "street" if "verejn" in t else ""
+        return ""
     ded = re.search(r"parkovac\w+\s+(?:miest|stát[ií]|stan)|garáž|garaz|stát[ií]|stání|parking|vlastn\w+\s+parkov", t)
     if not (ded or re.search(r"parkov", t)):
         return ""
@@ -409,7 +409,7 @@ def enrich(items, today):
     n = ok = 0
     for it in items:
         c = cache.get(it["id"])
-        if c and c.get("v") == 5 and (today - date.fromisoformat(c["d"])).days < DETAIL_TTL:
+        if c and c.get("v") == 6 and (today - date.fromisoformat(c["d"])).days < DETAIL_TTL:
             pass
         elif n < DETAIL_MAX and it.get("url"):
             n += 1
@@ -431,7 +431,7 @@ def enrich(items, today):
                     en, ea = parse_energy(script_text(html))
                 if len(DIAG.setdefault("samples", [])) < 6:
                     DIAG["samples"].append([it["url"], len(t), en, ea, t[:260]])
-                c = {"v": 5, "d": today.isoformat(), "energy": en, "energy_amt": ea,
+                c = {"v": 6, "d": today.isoformat(), "energy": en, "energy_amt": ea,
                      "parking": parse_parking(t), "cond": detail_cond(t)}
                 cache[it["id"]] = c
         if c:
@@ -496,6 +496,39 @@ def finish_events(flats, events, today):
 
 
 EXCLUDE_IDS = {"JuOvYGdou7w"}      # natvrdo vyradené inzeráty (ďalšie ID patria do data/exclude.txt)
+
+
+def migrate_ids(items):
+    """ID s '_' alebo '-' sa kedysi ukladali skrátené (Ju_hGtc… -> Ju). Opraví uložené dáta na plné ID."""
+    cand = {}
+    for it in items:
+        if re.search(r"[_-]", it["id"]):
+            cand.setdefault(re.match(r"[A-Za-z0-9]+", it["id"]).group(0), []).append(it)
+    flats = read_csv(DATA / "listings.csv")
+    ren = {}
+    for f in flats:
+        for i in f["ids"].split("|"):
+            c = cand.get(i, [])
+            if len(c) > 1:       # viac inzerátov s rovnakým skráteným ID: vyberie sa podľa dispozície a m²
+                try:
+                    fa = float(f["area"])
+                except ValueError:
+                    fa = None
+                c = [x for x in c if x["layout"] == f["layout"] and (fa is None or x["area"] is None or abs(x["area"] - fa) <= 3)]
+            if len(c) == 1:
+                ren[i] = c[0]["id"]
+    if not ren:
+        return
+    for f in flats:
+        f["ids"] = "|".join(ren.get(i, i) for i in f["ids"].split("|"))
+        f["flat_id"] = ren.get(f["flat_id"], f["flat_id"])
+    write_csv(DATA / "listings.csv", FLAT_FIELDS, flats)
+    for name, fields in (("prices.csv", PRICE_FIELDS), ("events.csv", EVENT_FIELDS)):
+        rows = read_csv(DATA / name)
+        for r in rows:
+            r["flat_id"] = ren.get(r["flat_id"], r["flat_id"])
+        write_csv(DATA / name, fields, rows)
+    print(f"opravené ID inzerátov: {len(ren)}")
 
 
 def load_exclude():
@@ -1046,6 +1079,7 @@ def main():
     ex = load_exclude()
     purge(ex)
     items = [i for i in scrape() if i["id"] not in ex]
+    migrate_ids(items)
     if not items:
         sys.exit("CHYBA: nenašiel som žiadne inzeráty (blokovanie alebo zmena stránky). Dáta som nezmenil.")
     enrich(items, today)
