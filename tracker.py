@@ -387,7 +387,9 @@ def detail_text(html):
     for t in soup(["script", "style", "noscript"]):
         t.decompose()
     t = " ".join(soup.get_text(" ", strip=True).split())
-    t = t[:7000]       # hlavička s cenou a energiami je pred popisom
+    m = re.search(r"\+\s*(\d{2,3})\s*€\s*/\s*mes\.?\s*energi\w*", t)    # riadok pod cenou kdekoľvek v texte
+    head = (" + %s €/mes. energie " % m.group(1)) if m else ""
+    t = head + t[:7000]       # hlavička s cenou a energiami je pred popisom
     # hlavička „530 €/mes. s energiami“ býva v rozpore s popisom, preto sa ignoruje
     return re.sub(r"\d[\d\s]*€\s*/\s*mes\.?\s*s\s+energi\w*", " ", t)
 
@@ -410,7 +412,7 @@ def enrich(items, today):
     n = ok = 0
     for it in items:
         c = cache.get(it["id"])
-        if c and c.get("v") == 6 and (today - date.fromisoformat(c["d"])).days < DETAIL_TTL:
+        if c and c.get("v") == 7 and (today - date.fromisoformat(c["d"])).days < DETAIL_TTL:
             pass
         elif n < DETAIL_MAX and it.get("url"):
             n += 1
@@ -422,6 +424,8 @@ def enrich(items, today):
                 else:
                     r = requests.get(it["url"], headers=HEADERS, timeout=30)
                     time.sleep(2)
+                    st = DIAG.setdefault("status", {})
+                    st[str(r.status_code)] = st.get(str(r.status_code), 0) + 1
                     html = r.text if r.status_code == 200 else None
             except requests.RequestException:
                 html = None
@@ -432,7 +436,7 @@ def enrich(items, today):
                     en, ea = parse_energy(script_text(html))
                 if len(DIAG.setdefault("samples", [])) < 6:
                     DIAG["samples"].append([it["url"], len(t), en, ea, t[:260]])
-                c = {"v": 6, "d": today.isoformat(), "energy": en, "energy_amt": ea,
+                c = {"v": 7, "d": today.isoformat(), "energy": en, "energy_amt": ea,
                      "parking": parse_parking(t), "cond": detail_cond(t)}
                 cache[it["id"]] = c
         if c:
@@ -893,6 +897,7 @@ function renderMerged() {
     h += '<p>Kontrola počtu (stránka uvádza / našla som): ' + ((g.check || []).map(c => esc(c[0]) + ' ' + (c[1] === null ? '?' : c[1]) + ' / ' + c[2] + (c[1] !== null && c[1] !== c[2] ? ' ⚠' : ' ✓')).join(' · ') || 'nič') + '</p>';
     h += '<p>Detaily (stiahnuté teraz / doplnené / spolu): ' + esc((g.detail || ['?']).join(' / ')) + '</p>';
     h += (g.samples || []).map(x => '<p><a href="' + esc(x[0]) + '" target="_blank" rel="noopener">detail</a> dĺžka ' + x[1] + ', energie ' + esc(x[2]) + ' ' + esc(x[3]) + '<br>' + esc(x[4]) + '</p>').join('');
+    h += '<p>HTTP odpovede detailov: ' + esc(JSON.stringify(g.status || {})) + '</p>';
     h += '<p>Preskočené (iná lokalita): ' + g.skipped.length + '</p>';
     h += g.skipped.map(x => '<p><a href="' + esc(x[1]) + '" target="_blank" rel="noopener">' + esc(x[0]) + '</a> ' + esc(x[2]) + '</p>').join('');
     $('dglist').innerHTML = h;
