@@ -201,6 +201,38 @@ def score(it):
     return sum(it[k] not in (None, "") for k in ("price", "area", "layout", "street"))
 
 
+def header_fields(node):
+    """Cena a riadok s energiami z hlavičky (prvé <p> s €/mes. v nadpisovom štýle a prvé s „energi“)."""
+    price = en_txt = None
+    for pp in node.find_all("p"):
+        t = " ".join(pp.get_text(" ", strip=True).split())
+        if "€" not in t or "mes" not in t:
+            continue
+        cls = " ".join(pp.get("class") or [])
+        if price is None and "h3" in cls and not t.startswith("+"):
+            m = re.search(r"(\d{1,3}(?:[\s\u00a0]\d{3})+|\d{2,5})\s*€", t)
+            if m:
+                price = int(re.sub(r"\D", "", m.group(1)))
+        if en_txt is None and re.search(r"energi", t, re.I):
+            en_txt = t
+        if price is not None and en_txt is not None:
+            break
+    return price, en_txt
+
+
+def apply_header(item, node):
+    price, en_txt = header_fields(node)
+    if price and 50 <= price <= 20000:
+        item["price"] = price
+    if en_txt:
+        en, ea = parse_energy(en_txt)
+        if not en and re.search(r"energi", en_txt, re.I):
+            en, ea = ("incl", 0) if re.search(r"vrátane|v\s+cene|s\s+energi", en_txt, re.I) else ("sep?", 0)
+        if en:
+            item["energy"], item["energy_amt"] = en, ea
+            item["hdr_energy"] = True
+
+
 def parse(html):
     soup = BeautifulSoup(html, "html.parser")
     found, urls, titles = {}, {}, {}
@@ -238,6 +270,7 @@ def parse(html):
                 DIAG["skipped"].append([lid, urls.get(lid, ""), "(komerčný) " + text[:200]])
             continue
         item = parse_text(lid, text)
+        apply_header(item, node)
         if lid not in found or score(item) > score(found[lid]):
             found[lid] = item
     for lid, it in found.items():
@@ -412,7 +445,7 @@ def enrich(items, today):
     n = ok = 0
     for it in items:
         c = cache.get(it["id"])
-        if c and c.get("v") == 7 and (today - date.fromisoformat(c["d"])).days < DETAIL_TTL:
+        if c and c.get("v") == 8 and (today - date.fromisoformat(c["d"])).days < DETAIL_TTL:
             pass
         elif n < DETAIL_MAX and it.get("url"):
             n += 1
@@ -432,16 +465,22 @@ def enrich(items, today):
             if html:
                 t = detail_text(html)
                 en, ea = parse_energy(t)
+                hdr = {}
+                apply_header(hdr, BeautifulSoup(html, "html.parser"))
+                if hdr.get("energy"):
+                    en, ea = hdr["energy"], hdr["energy_amt"]
                 if not en:       # záloha: údaj môže byť len v JSON skripte stránky
                     en, ea = parse_energy(script_text(html))
                 if len(DIAG.setdefault("samples", [])) < 6:
                     DIAG["samples"].append([it["url"], len(t), en, ea, t[:260]])
-                c = {"v": 7, "d": today.isoformat(), "energy": en, "energy_amt": ea,
+                c = {"v": 8, "d": today.isoformat(), "energy": en, "energy_amt": ea,
                      "parking": parse_parking(t), "cond": detail_cond(t)}
                 cache[it["id"]] = c
         if c:
             ok += 1
-            it["energy"], it["energy_amt"], it["parking"] = c["energy"], c["energy_amt"], c["parking"]
+            if not it.get("hdr_energy") and (c["energy"] or not it.get("energy")):      # ak detail energie nenašiel, ostane údaj z karty
+                it["energy"], it["energy_amt"] = c["energy"], c["energy_amt"]
+            it["parking"] = c["parking"]
             if c["cond"]:
                 it["cond"] = c["cond"]
     DATA.mkdir(exist_ok=True)
