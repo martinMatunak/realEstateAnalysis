@@ -176,7 +176,10 @@ def parse_text(lid, text):
         if not 10 <= area <= 400:
             area = None
     layout, best = None, 10 ** 9
-    for pat in (r"(garsón\w*)", r"(\d(?:[.,]5)?)\s*-?\s*izb", r"\b(\d)\s*i\s+byt"):
+    mm = re.search(r"(?<![\d.,])(\d)\s*izbov\w*\s+byt", text, re.I)   # štítok portálu „2 izbový byt“ má prednosť
+    if mm:
+        layout, best = mm.group(1), -1
+    for pat in (r"(garsón\w*)", r"(?<![\d.,])(\d(?:[.,]5)?)\s*-?\s*izb", r"(?<![\d.,])\b(\d)\s*i\s+byt"):
         m = re.search(pat, text, re.I)
         if m and m.start() < best:
             best = m.start()
