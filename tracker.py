@@ -267,7 +267,8 @@ def parse(html):
             if len(DIAG["skipped"]) < 40:
                 DIAG["skipped"].append([lid, urls.get(lid, ""), text[:220]])
             continue
-        if COMM_RE.search(titles.get(lid, "") + " " + text[:200]):   # komerčné priestory nie sú byty
+        has_layout = re.search(r"(?<![\d.,])\d\s*izbov\w*\s+byt|garsón", text, re.I)
+        if not has_layout and COMM_RE.search(titles.get(lid, "") + " " + text[:200]):   # komerčné priestory nie sú byty
             SKIPPED[0] += 1
             if len(DIAG["skipped"]) < 40:
                 DIAG["skipped"].append([lid, urls.get(lid, ""), "(komerčný) " + text[:200]])
@@ -601,7 +602,7 @@ def purge(ex):
     bad = set()
     for f in flats:
         ids = set(f["ids"].split("|")) | {f["flat_id"]}
-        if ids & ex or (first and COMM_RE.search((f.get("title") or "") + " " + (f.get("snap") or "")[:200])):
+        if ids & ex or (first and not f.get("layout") and COMM_RE.search((f.get("title") or "") + " " + (f.get("snap") or "")[:200])):
             bad.add(f["flat_id"])
     if not bad:
         return
